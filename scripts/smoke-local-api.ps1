@@ -247,6 +247,8 @@ try {
     $operatorStatusText = if ($operatorReady) { "enabled" } else { "skipped-not-configured" }
     $memoryStatusText = if ($memoryReady) { "enabled" } else { "skipped-not-configured" }
     Write-Host "Smoke test passed: local API + daemon + CLI flows (operator=$operatorStatusText, memory=$memoryStatusText)"
+    # Ensure callers don't inherit a stale non-zero exit code from transient CLI probes.
+    $global:LASTEXITCODE = 0
 }
 finally {
     if ($desktopProc -and -not $desktopProc.HasExited) {
