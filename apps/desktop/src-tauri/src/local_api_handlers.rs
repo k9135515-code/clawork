@@ -6,24 +6,26 @@ use crate::{
     append_audit, authorize_action, browser_navigate_inner, call_mcp_tool_inner, config_set_inner,
     config_show_inner, daemon_restart_inner, daemon_start_inner, daemon_stop_inner,
     ensure_action_still_authorized, fs_operate_inner, get_audit_events_inner,
-    list_inbound_messages_inner, mail_inbox_unreplied_inner, memory_recent_inner,
-    memory_search_inner, memory_store_inner, office_create_excel_inner,
-    office_upload_graph_file_inner, policy_list_domain_inner, policy_set_domain_inner,
-    send_message_inner, status_inner, task_run_inner, AppState, ApproveReq, BrowserNavigateApiReq,
-    CommandError, ConfigSetReq, CreateSkillReq, FsOperateApiReq, InboundQuery, LimitQuery,
-    MailInboxItem, MailInboxQuery, McpCallReq, MemorySearchReq, MemoryStoreReq, OfficeExcelApiReq,
-    OfficeUploadApiReq, RunSkillReq, SendMessageReq, TaskRunReq,
+    get_daily_briefing_inner, list_inbound_messages_inner, list_proactive_suggestions_inner,
+    mail_inbox_unreplied_inner, memory_recent_inner, memory_search_inner, memory_store_inner,
+    office_create_excel_inner, office_upload_graph_file_inner, policy_list_domain_inner,
+    policy_set_domain_inner, send_message_inner, status_inner, task_run_inner, AppState,
+    ApproveReq, BrowserNavigateApiReq, CommandError, ConfigSetReq, CreateSkillReq, FsOperateApiReq,
+    InboundQuery, LimitQuery, MailInboxItem, MailInboxQuery, McpCallReq, MemorySearchReq,
+    MemoryStoreReq, OfficeExcelApiReq, OfficeUploadApiReq, RunSkillReq, SendMessageReq, TaskRunReq,
 };
 use axum::extract::{Query, State as AxumState};
 use axum::http::HeaderMap;
 use axum::Json;
 use chrono::Utc;
 use clawork_core::{
-    ActionKind, ActionRequest, AuditEvent, BrowserRunResult, DomainPolicy, FsOperationResult,
-    InboundMessage, OfficeUploadResult, SkillRequest, SkillResponse, SkillRuntime, TaskInfo,
+    ActionKind, ActionRequest, AuditEvent, BrowserRunRequest, BrowserRunResult, DomainPolicy,
+    FsOperationKind, FsOperationRequest, FsOperationResult, InboundMessage, OfficeUploadResult,
+    SkillRequest, SkillResponse, SkillRuntime, TaskInfo,
 };
 use clawork_memory::{MemoryHit, MemoryRecord};
 use clawork_skills::SkillManifest;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -379,4 +381,417 @@ pub(crate) async fn api_policy_list_domain(
 ) -> Result<Json<Vec<DomainPolicy>>, CommandError> {
     require_auth(&state, &headers)?;
     Ok(Json(policy_list_domain_inner(&state).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct NlExecuteReq {
+    instruction: String,
+    dry_run: Option<bool>,
+    continue_on_error: Option<bool>,
+    approval_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NlPlannedStep {
+    action: String,
+    #[serde(default)]
+    params: Value,
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct NlStepOutcome {
+    index: usize,
+    action: String,
+    ok: bool,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct NlExecuteResult {
+    instruction: String,
+    plan_source: String,
+    model: Option<String>,
+    dry_run: bool,
+    steps: Vec<NlPlannedStep>,
+    outcomes: Vec<NlStepOutcome>,
+}
+
+pub(crate) async fn api_nl_execute(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<NlExecuteReq>,
+) -> Result<Json<NlExecuteResult>, CommandError> {
+    require_auth(&state, &headers)?;
+    if body.instruction.trim().is_empty() {
+        return Err(CommandError::validation("instruction must not be empty"));
+    }
+
+    let (steps, plan_source, model) = match build_llm_plan(&state, &body.instruction).await {
+        Ok(Some((steps, model))) => (steps, "llm".to_string(), Some(model)),
+        _ => (build_rule_plan(&body.instruction), "rule".to_string(), None),
+    };
+
+    if steps.is_empty() {
+        return Err(CommandError::validation(
+            "could not derive executable steps from instruction",
+        ));
+    }
+
+    let dry_run = body.dry_run.unwrap_or(false);
+    let continue_on_error = body.continue_on_error.unwrap_or(false);
+    let mut outcomes = Vec::<NlStepOutcome>::new();
+
+    if !dry_run {
+        for (idx, step) in steps.iter().enumerate() {
+            match execute_planned_step(&state, step, body.approval_token.clone()).await {
+                Ok(result) => outcomes.push(NlStepOutcome {
+                    index: idx,
+                    action: step.action.clone(),
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                }),
+                Err(err) => {
+                    outcomes.push(NlStepOutcome {
+                        index: idx,
+                        action: step.action.clone(),
+                        ok: false,
+                        result: None,
+                        error: Some(err.message.clone()),
+                    });
+                    if !continue_on_error {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(NlExecuteResult {
+        instruction: body.instruction,
+        plan_source,
+        model,
+        dry_run,
+        steps,
+        outcomes,
+    }))
+}
+
+async fn execute_planned_step(
+    state: &AppState,
+    step: &NlPlannedStep,
+    approval_token: Option<String>,
+) -> Result<Value, CommandError> {
+    let params = &step.params;
+    match step.action.as_str() {
+        "status" => serde_json::to_value(status_inner(state).await)
+            .map_err(|e| CommandError::internal(format!("serialize status: {e}"))),
+        "briefing" => {
+            let briefing = get_daily_briefing_inner(state).await?;
+            serde_json::to_value(briefing)
+                .map_err(|e| CommandError::internal(format!("serialize briefing: {e}")))
+        }
+        "suggestions" => {
+            let limit = param_i64(params, "limit").map(|v| v.max(1) as usize);
+            let list = list_proactive_suggestions_inner(state, limit).await?;
+            serde_json::to_value(list)
+                .map_err(|e| CommandError::internal(format!("serialize suggestions: {e}")))
+        }
+        "daemon_start" => {
+            let v = daemon_start_inner(state).await?;
+            serde_json::to_value(v).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "daemon_stop" => {
+            let v = daemon_stop_inner(state).await?;
+            serde_json::to_value(v).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "daemon_restart" => {
+            let v = daemon_restart_inner(state).await?;
+            serde_json::to_value(v).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "task_run" => {
+            let task_id = param_str(params, "task_id")?;
+            let v = task_run_inner(state, task_id.to_string()).await?;
+            serde_json::to_value(v).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "memory_store" => {
+            let text = param_str(params, "text")?;
+            let id = memory_store_inner(state, text.to_string(), None, approval_token).await?;
+            Ok(serde_json::json!({ "id": id }))
+        }
+        "memory_search" => {
+            let query = param_str(params, "query")?;
+            let limit = param_i64(params, "limit");
+            let hits = memory_search_inner(state, query.to_string(), limit).await?;
+            serde_json::to_value(hits).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "fs_read" => {
+            let path = param_str(params, "path")?;
+            let req = FsOperationRequest {
+                kind: FsOperationKind::ReadFile,
+                path: path.to_string(),
+                content: None,
+            };
+            let res = fs_operate_inner(state, req, approval_token).await?;
+            serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "fs_write" => {
+            let path = param_str(params, "path")?;
+            let content = param_str(params, "content")?;
+            let req = FsOperationRequest {
+                kind: FsOperationKind::WriteFile,
+                path: path.to_string(),
+                content: Some(content.to_string()),
+            };
+            let res = fs_operate_inner(state, req, approval_token).await?;
+            serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "message_send" => {
+            let adapter = param_str(params, "adapter")?;
+            let to = param_str(params, "to")?;
+            let content = param_str(params, "content")?;
+            let res = send_message_inner(
+                state,
+                adapter.to_string(),
+                to.to_string(),
+                content.to_string(),
+                approval_token,
+            )
+            .await?;
+            serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "browser_navigate" => {
+            let url = param_str(params, "url")?;
+            let timeout_seconds = param_i64(params, "timeout_seconds")
+                .map(|v| v.max(1) as u64)
+                .unwrap_or(30);
+            let allow_domains = params
+                .get("allow_domains")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let headed = params
+                .get("headed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let req = BrowserRunRequest {
+                url: url.to_string(),
+                allow_domains,
+                headed,
+                timeout_seconds,
+            };
+            let res = browser_navigate_inner(state, req, approval_token).await?;
+            serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "mcp_call" => {
+            let tool_name = param_str(params, "tool_name")?;
+            let payload = params
+                .get("payload")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let route = params
+                .get("route")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let res =
+                call_mcp_tool_inner(state, tool_name.to_string(), payload, route, approval_token)
+                    .await?;
+            serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        other => Err(CommandError::validation(format!(
+            "unsupported action '{other}'"
+        ))),
+    }
+}
+
+fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, CommandError> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| CommandError::validation(format!("missing '{key}'")))
+}
+
+fn param_i64(params: &Value, key: &str) -> Option<i64> {
+    params.get(key).and_then(Value::as_i64)
+}
+
+fn build_rule_plan(instruction: &str) -> Vec<NlPlannedStep> {
+    let text = instruction.trim();
+    let lower = text.to_ascii_lowercase();
+
+    if lower.contains("status") || lower.contains("状態") {
+        return vec![NlPlannedStep {
+            action: "status".into(),
+            params: serde_json::json!({}),
+            rationale: Some("status keyword matched".into()),
+        }];
+    }
+    if lower.contains("briefing") || lower.contains("ブリーフィング") || lower.contains("要約")
+    {
+        return vec![NlPlannedStep {
+            action: "briefing".into(),
+            params: serde_json::json!({}),
+            rationale: Some("briefing/summary keyword matched".into()),
+        }];
+    }
+    if let Some(rest) = text.strip_prefix("memory search ") {
+        return vec![NlPlannedStep {
+            action: "memory_search".into(),
+            params: serde_json::json!({ "query": rest.trim(), "limit": 5 }),
+            rationale: Some("memory search command matched".into()),
+        }];
+    }
+    if let Some(rest) = text.strip_prefix("memory store ") {
+        return vec![NlPlannedStep {
+            action: "memory_store".into(),
+            params: serde_json::json!({ "text": rest.trim() }),
+            rationale: Some("memory store command matched".into()),
+        }];
+    }
+    if let Some(rest) = text.strip_prefix("fs read ") {
+        return vec![NlPlannedStep {
+            action: "fs_read".into(),
+            params: serde_json::json!({ "path": rest.trim() }),
+            rationale: Some("fs read command matched".into()),
+        }];
+    }
+    if let Some(rest) = text.strip_prefix("fs write ") {
+        if let Some((path, content)) = rest.split_once("::") {
+            return vec![NlPlannedStep {
+                action: "fs_write".into(),
+                params: serde_json::json!({ "path": path.trim(), "content": content.trim() }),
+                rationale: Some("fs write command matched".into()),
+            }];
+        }
+    }
+    if let Some(rest) = text.strip_prefix("send ") {
+        if let Some((head, content)) = rest.split_once("::") {
+            let parts = head.split_whitespace().collect::<Vec<_>>();
+            if parts.len() >= 2 {
+                return vec![NlPlannedStep {
+                    action: "message_send".into(),
+                    params: serde_json::json!({
+                        "adapter": parts[0],
+                        "to": parts[1],
+                        "content": content.trim()
+                    }),
+                    rationale: Some("send command matched".into()),
+                }];
+            }
+        }
+    }
+    if let Some(url) = text.strip_prefix("open ") {
+        return vec![NlPlannedStep {
+            action: "browser_navigate".into(),
+            params: serde_json::json!({ "url": url.trim(), "timeout_seconds": 30 }),
+            rationale: Some("open command matched".into()),
+        }];
+    }
+
+    vec![
+        NlPlannedStep {
+            action: "briefing".into(),
+            params: serde_json::json!({}),
+            rationale: Some("fallback step 1".into()),
+        },
+        NlPlannedStep {
+            action: "suggestions".into(),
+            params: serde_json::json!({ "limit": 5 }),
+            rationale: Some("fallback step 2".into()),
+        },
+    ]
+}
+
+async fn build_llm_plan(
+    state: &AppState,
+    instruction: &str,
+) -> Result<Option<(Vec<NlPlannedStep>, String)>, CommandError> {
+    let api_key = match std::env::var("CLAWORK_OPENAI_API_KEY") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Ok(None),
+    };
+    let model =
+        std::env::var("CLAWORK_OPENAI_CHAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+
+    let system = "You are a planner for a local desktop agent. Return only JSON: {\"steps\":[{\"action\":\"status|briefing|suggestions|memory_store|memory_search|fs_read|fs_write|message_send|browser_navigate|mcp_call|daemon_start|daemon_stop|daemon_restart|task_run\",\"params\":{},\"rationale\":\"...\"}]}. Use fs write format with params.path and params.content. For message_send include adapter,to,content.";
+    let payload = serde_json::json!({
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role":"system","content": system},
+            {"role":"user","content": instruction}
+        ]
+    });
+
+    let resp = state
+        .http
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| CommandError::internal(format!("llm planner request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| CommandError::internal(format!("llm planner response parse failed: {e}")))?;
+    let content = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if content.is_empty() {
+        return Ok(None);
+    }
+
+    let json_text = strip_markdown_fence(content);
+    let parsed: Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let Some(steps_value) = parsed.get("steps").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut steps = Vec::<NlPlannedStep>::new();
+    for v in steps_value {
+        if let Ok(step) = serde_json::from_value::<NlPlannedStep>(v.clone()) {
+            if !step.action.trim().is_empty() {
+                steps.push(step);
+            }
+        }
+    }
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((steps, model)))
+}
+
+fn strip_markdown_fence(input: &str) -> &str {
+    let trimmed = input.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.trim_start_matches("json").trim_start();
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+    }
+    trimmed
 }

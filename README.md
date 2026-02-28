@@ -101,6 +101,10 @@ X-Clawork-Token: <data/cli.token の値>
 
 ```bash
 clawork status
+clawork ask "statusを表示して"
+clawork ask "fs write data/note.txt :: 今日のメモを保存して"
+clawork ask "briefingを見せて"
+clawork ask "send telegram 123456 :: 進捗を送って" --dry-run
 clawork approve confirm-xxxx
 clawork token issue --ttl-seconds 3600
 clawork token revoke <token>
@@ -150,6 +154,7 @@ clawork policy domain list
 
 `research create` と `media image/video` に `--project-id` を指定すると、生成物が `project_artifacts` に citation 付きで自動登録されます。
 `mcp` は `--route local|remote` を指定できます。`remote` は `CLAWORK_REMOTE_MCP_URL` が必要です。
+`ask` は自然言語から実行計画を作って操作します。`CLAWORK_OPENAI_API_KEY` があれば LLM 計画、未設定時はルールベース計画にフォールバックします。
 `mcp --route remote` のレスポンス契約は固定です:
 
 ```json

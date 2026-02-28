@@ -61,8 +61,9 @@ use local_api_handlers::{
     api_browser_navigate, api_config_set, api_config_show, api_create_skill, api_daemon_restart,
     api_daemon_start, api_daemon_stop, api_fs_operate, api_get_status, api_get_tasks,
     api_inbound_messages, api_list_skills, api_logs, api_mail_inbox_unreplied, api_mcp_call,
-    api_memory_recent, api_memory_search, api_memory_store, api_office_excel, api_office_upload,
-    api_policy_list_domain, api_policy_set_domain, api_run_skill, api_send_message, api_task_run,
+    api_memory_recent, api_memory_search, api_memory_store, api_nl_execute, api_office_excel,
+    api_office_upload, api_policy_list_domain, api_policy_set_domain, api_run_skill,
+    api_send_message, api_task_run,
 };
 use local_auth::ensure_cli_token;
 use mcp_local::maybe_call_local_connector_mcp_tool;
@@ -3625,6 +3626,7 @@ async fn run_local_api(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/v1/skills/run", post(api_run_skill))
         .route("/v1/skills/create", post(api_create_skill))
         .route("/v1/messages/send", post(api_send_message))
+        .route("/v1/nl/execute", post(api_nl_execute))
         .route("/v1/messages/inbound", get(api_inbound_messages))
         .route("/v1/mail/inbox/unreplied", get(api_mail_inbox_unreplied))
         .route("/v1/fs/operate", post(api_fs_operate))

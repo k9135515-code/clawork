@@ -20,6 +20,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Status,
+    Ask {
+        instruction: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        continue_on_error: bool,
+    },
     Approve {
         token: String,
     },
@@ -728,6 +735,24 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Status => {
             let res: Value = client.get_json("/v1/status", None).await?;
+            print_json(&res)?;
+        }
+        Commands::Ask {
+            instruction,
+            dry_run,
+            continue_on_error,
+        } => {
+            let res: Value = with_approval_retry(&client, |approval_token| {
+                let body = serde_json::json!({
+                    "instruction": instruction.clone(),
+                    "dry_run": dry_run,
+                    "continue_on_error": continue_on_error,
+                    "approval_token": approval_token
+                });
+                let client = client.clone();
+                async move { client.post_json("/v1/nl/execute", &body).await }
+            })
+            .await?;
             print_json(&res)?;
         }
         Commands::Approve { token } => {
