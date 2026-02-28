@@ -164,7 +164,7 @@ try {
             Pop-Location
         }
     }
-    Invoke-Step "local smoke (daemon/API/CLI)" { powershell -ExecutionPolicy Bypass -File "./scripts/smoke-local-api.ps1" -SkipBuild }
+    Invoke-Step "local smoke (daemon/API/CLI)" { powershell -ExecutionPolicy Bypass -File "./scripts/smoke-local-api.ps1" }
 
     if (-not $SkipReleaseBuild) {
         Invoke-Step "cargo build --release -p clawork-cli" { cargo build --release -p clawork-cli }
