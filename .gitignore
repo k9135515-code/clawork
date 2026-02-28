@@ -1,0 +1,11 @@
+﻿node_modules/
+apps/desktop/ui/dist/
+target/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.*
+.vscode/
+reports/preflight-*.md
+reports/release-readiness-*.md
