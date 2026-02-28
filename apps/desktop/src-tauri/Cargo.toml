@@ -1,0 +1,43 @@
+﻿[package]
+name = "clawork-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "clawork_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clawork-adapters = { path = "../../../crates/clawork-adapters" }
+clawork-audit = { path = "../../../crates/clawork-audit" }
+clawork-capabilities = { path = "../../../crates/clawork-capabilities" }
+clawork-browser = { path = "../../../crates/clawork-browser" }
+clawork-core = { path = "../../../crates/clawork-core" }
+clawork-daemon = { path = "../../../crates/clawork-daemon" }
+clawork-fs = { path = "../../../crates/clawork-fs" }
+clawork-llm = { path = "../../../crates/clawork-llm" }
+clawork-mcp-client = { path = "../../../crates/clawork-mcp-client" }
+clawork-memory = { path = "../../../crates/clawork-memory" }
+clawork-office = { path = "../../../crates/clawork-office" }
+clawork-operator = { path = "../../../crates/clawork-operator" }
+clawork-skills = { path = "../../../crates/clawork-skills" }
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+tauri = { version = "2.1.1", features = [] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

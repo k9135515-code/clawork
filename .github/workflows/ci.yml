@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  rust-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Cargo test
+        run: cargo test --workspace
+
+  ui-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/desktop/ui
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop/ui
+        run: npm run build
+
+  windows-ui-repro:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/desktop/ui
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop/ui
+        run: npm run build
+
+  windows-local-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Local API smoke test
+        shell: powershell
+        run: ./scripts/smoke-local-api.ps1

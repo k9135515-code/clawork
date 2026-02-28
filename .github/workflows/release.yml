@@ -1,0 +1,169 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  preflight-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/desktop/ui
+        run: npm ci
+      - name: Run preflight gate
+        shell: powershell
+        run: ./scripts/preflight-release.ps1 -SkipReleaseBuild -ReportPath reports/preflight-release-gate.md
+      - name: Run release readiness gate
+        shell: powershell
+        run: ./scripts/release-readiness.ps1 -PreflightReportPath reports/preflight-release-gate.md -ReportPath reports/release-readiness-gate.md
+      - name: Upload preflight gate report
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-release-gate
+          path: |
+            reports/preflight-release-gate.md
+            reports/release-readiness-gate.md
+
+  build:
+    needs: preflight-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: clawork-linux-x86_64.tar.gz
+          - os: macos-latest
+            artifact: clawork-macos-x86_64.tar.gz
+          - os: windows-latest
+            artifact: clawork-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/desktop/ui
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop/ui
+        run: npm run build
+      - name: Windows local smoke
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/smoke-local-api.ps1
+      - name: Build CLI (placeholder)
+        run: cargo build --release -p clawork-cli
+      - name: Validate Windows release CLI size budget
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $path = "target/release/clawork.exe"
+          if (-not (Test-Path $path)) {
+            throw "missing release binary: $path"
+          }
+          $sizeMb = [Math]::Round(((Get-Item $path).Length / 1MB), 2)
+          Write-Host "Windows release CLI size: $sizeMb MB"
+          if ($sizeMb -gt 15) {
+            throw "Windows release CLI exceeds 15 MB budget: $sizeMb MB"
+          }
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/clawork.exe dist/clawork.exe
+            (cd dist && 7z a "${{ matrix.artifact }}" clawork.exe)
+          else
+            cp target/release/clawork dist/clawork
+            (cd dist && tar -czf "${{ matrix.artifact }}" clawork)
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          else
+            (cd dist && shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Build checksum manifest
+        shell: bash
+        run: |
+          find dist -name '*.sha256' -type f -print0 | sort -z | xargs -0 cat > dist/SHA256SUMS.txt
+      - name: Verify release bundle completeness
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "clawork-linux-x86_64.tar.gz"
+            "clawork-macos-x86_64.tar.gz"
+            "clawork-windows-x86_64.zip"
+          )
+          for asset in "${required[@]}"; do
+            asset_path="$(find dist -name "$asset" -type f | head -n1 || true)"
+            if [[ -z "$asset_path" ]]; then
+              echo "missing release asset: $asset" >&2
+              exit 1
+            fi
+            sha_path="$(find dist -name "$asset.sha256" -type f | head -n1 || true)"
+            if [[ -z "$sha_path" ]]; then
+              echo "missing checksum file: $asset.sha256" >&2
+              exit 1
+            fi
+          done
+          if [[ ! -f dist/SHA256SUMS.txt ]]; then
+            echo "missing checksum manifest: dist/SHA256SUMS.txt" >&2
+            exit 1
+          fi
+          entries="$(grep -c 'clawork-.*\.\(zip\|tar\.gz\)' dist/SHA256SUMS.txt || true)"
+          if [[ "$entries" -lt 3 ]]; then
+            echo "SHA256SUMS.txt does not include all expected assets" >&2
+            exit 1
+          fi
+      - name: Verify governance reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          preflight_report="$(find dist -name 'preflight-release-gate.md' -type f | head -n1 || true)"
+          readiness_report="$(find dist -name 'release-readiness-gate.md' -type f | head -n1 || true)"
+          if [[ -z "$preflight_report" ]]; then
+            echo "missing governance report: preflight-release-gate.md" >&2
+            exit 1
+          fi
+          if [[ -z "$readiness_report" ]]; then
+            echo "missing governance report: release-readiness-gate.md" >&2
+            exit 1
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*

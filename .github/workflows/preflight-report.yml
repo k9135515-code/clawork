@@ -1,0 +1,36 @@
+name: preflight-report
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  windows-preflight:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          cache: npm
+          cache-dependency-path: apps/desktop/ui/package-lock.json
+      - name: Install frontend deps
+        working-directory: apps/desktop/ui
+        run: npm ci
+      - name: Run preflight (skip release build)
+        shell: powershell
+        run: ./scripts/preflight-release.ps1 -SkipReleaseBuild -ReportPath reports/preflight-ci.md
+      - name: Run release readiness checks
+        shell: powershell
+        run: ./scripts/release-readiness.ps1 -PreflightReportPath reports/preflight-ci.md -ReportPath reports/release-readiness-ci.md
+      - name: Upload preflight report
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-report
+          path: |
+            reports/preflight-ci.md
+            reports/release-readiness-ci.md
