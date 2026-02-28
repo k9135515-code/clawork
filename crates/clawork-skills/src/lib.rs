@@ -1,0 +1,625 @@
+use anyhow::Context;
+use async_trait::async_trait;
+use clawork_core::{SkillRequest, SkillResponse, SkillRuntime};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
+use tracing::{info, warn};
+use wasmtime::{Engine, Module};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillManifest {
+    pub id: String,
+    pub name: String,
+    pub abi_version: String,
+    pub entry_wasm: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub capabilities: SkillCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillCapabilities {
+    #[serde(default)]
+    pub fs_paths: Vec<String>,
+    #[serde(default)]
+    pub network: bool,
+    #[serde(default)]
+    pub env_vars: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct SkillRegistry {
+    root: PathBuf,
+    manifests: Arc<RwLock<HashMap<String, SkillManifest>>>,
+}
+
+impl SkillRegistry {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            manifests: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn list(&self) -> Vec<SkillManifest> {
+        self.manifests.read().values().cloned().collect()
+    }
+
+    pub fn find(&self, skill_id: &str) -> Option<SkillManifest> {
+        self.manifests.read().get(skill_id).cloned()
+    }
+
+    pub fn reload(&self) -> anyhow::Result<()> {
+        let mut next = HashMap::new();
+        if !self.root.exists() {
+            self.manifests.write().clear();
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(&self.root).context("scan skills directory")? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let manifest_path = entry.path().join("manifest.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+
+            let raw = std::fs::read_to_string(&manifest_path)?;
+            let manifest: SkillManifest = serde_json::from_str(&raw)
+                .with_context(|| format!("parse {}", manifest_path.display()))?;
+            next.insert(manifest.id.clone(), manifest);
+        }
+
+        *self.manifests.write() = next;
+        Ok(())
+    }
+
+    pub async fn watch(self) -> anyhow::Result<()> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(ev) = res {
+                    let _ = tx.send(ev.kind);
+                }
+            })?;
+
+        watcher.watch(&self.root, RecursiveMode::Recursive)?;
+        info!("watching skills directory: {}", self.root.display());
+
+        while let Some(kind) = rx.recv().await {
+            match kind {
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
+                    if let Err(err) = self.reload() {
+                        warn!("skill reload failed: {err:#}");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn create_skill_template(
+        &self,
+        skill_id: &str,
+        name: &str,
+        description: Option<String>,
+    ) -> anyhow::Result<SkillManifest> {
+        if !is_valid_skill_id(skill_id) {
+            return Err(anyhow::anyhow!(
+                "invalid skill_id '{skill_id}': use [a-zA-Z0-9_-]"
+            ));
+        }
+
+        let skill_dir = self.root.join(skill_id);
+        std::fs::create_dir_all(&skill_dir)
+            .with_context(|| format!("create skill directory: {}", skill_dir.display()))?;
+
+        let manifest = SkillManifest {
+            id: skill_id.to_string(),
+            name: name.to_string(),
+            abi_version: "v1".into(),
+            entry_wasm: "skill.wasm".into(),
+            description,
+            capabilities: SkillCapabilities::default(),
+        };
+
+        let manifest_path = skill_dir.join("manifest.json");
+        let manifest_body = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&manifest_path, manifest_body)
+            .with_context(|| format!("write manifest: {}", manifest_path.display()))?;
+
+        let wasm_path = skill_dir.join("skill.wasm");
+        if !wasm_path.exists() {
+            std::fs::write(&wasm_path, minimal_wasm_module())
+                .with_context(|| format!("write wasm: {}", wasm_path.display()))?;
+        }
+
+        let readme_path = skill_dir.join("README.md");
+        if !readme_path.exists() {
+            let readme = format!(
+                "# {}\n\nGenerated by Clawork self-skill creation.\n",
+                manifest.name
+            );
+            std::fs::write(&readme_path, readme)
+                .with_context(|| format!("write readme: {}", readme_path.display()))?;
+        }
+
+        self.reload()?;
+        Ok(manifest)
+    }
+}
+
+fn is_valid_skill_id(skill_id: &str) -> bool {
+    !skill_id.is_empty()
+        && skill_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn minimal_wasm_module() -> &'static [u8] {
+    &[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
+}
+
+#[derive(Clone)]
+pub struct WasmSkillRuntime {
+    registry: SkillRegistry,
+    engine: Engine,
+    root: PathBuf,
+    policy: SkillRuntimePolicy,
+}
+
+#[derive(Clone, Debug)]
+struct SkillRuntimePolicy {
+    timeout_ms: u64,
+    max_module_bytes: usize,
+    max_request_bytes: usize,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    allow_network: bool,
+    allowed_fs_roots: Vec<PathBuf>,
+    allowed_env_vars: HashSet<String>,
+}
+
+impl SkillRuntimePolicy {
+    fn from_env() -> Self {
+        Self {
+            timeout_ms: parse_u64_env("CLAWORK_SKILL_TIMEOUT_MS", 10_000),
+            max_module_bytes: parse_usize_env("CLAWORK_SKILL_MAX_MODULE_BYTES", 8 * 1024 * 1024),
+            max_request_bytes: parse_usize_env("CLAWORK_SKILL_MAX_REQUEST_BYTES", 256 * 1024),
+            max_stdout_bytes: parse_usize_env("CLAWORK_SKILL_MAX_STDOUT_BYTES", 1024 * 1024),
+            max_stderr_bytes: parse_usize_env("CLAWORK_SKILL_MAX_STDERR_BYTES", 256 * 1024),
+            allow_network: parse_bool_env("CLAWORK_SKILL_ALLOW_NETWORK", false),
+            allowed_fs_roots: parse_path_list_env("CLAWORK_SKILL_ALLOWED_FS_ROOTS"),
+            allowed_env_vars: parse_string_set_env("CLAWORK_SKILL_ALLOWED_ENV_VARS"),
+        }
+    }
+
+    fn enforce_capabilities(&self, manifest: &SkillManifest) -> anyhow::Result<()> {
+        if manifest.capabilities.network && !self.allow_network {
+            return Err(anyhow::anyhow!(
+                "skill '{}' requests network capability but runtime policy disallows network",
+                manifest.id
+            ));
+        }
+
+        if !manifest.capabilities.fs_paths.is_empty() {
+            if self.allowed_fs_roots.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "skill '{}' requests filesystem capability but no allowed fs roots are configured",
+                    manifest.id
+                ));
+            }
+            for requested in &manifest.capabilities.fs_paths {
+                let req = PathBuf::from(requested);
+                let allowed = self.allowed_fs_roots.iter().any(|root| {
+                    normalize_path_for_compare(&req).starts_with(normalize_path_for_compare(root))
+                });
+                if !allowed {
+                    return Err(anyhow::anyhow!(
+                        "skill '{}' requests fs path '{}' outside runtime policy",
+                        manifest.id,
+                        requested
+                    ));
+                }
+            }
+        }
+
+        if !manifest.capabilities.env_vars.is_empty() {
+            for var in &manifest.capabilities.env_vars {
+                if !self.allowed_env_vars.contains(var) {
+                    return Err(anyhow::anyhow!(
+                        "skill '{}' requests env var '{}' outside runtime policy",
+                        manifest.id,
+                        var
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WasmSkillRuntime {
+    pub fn new(root: impl Into<PathBuf>, registry: SkillRegistry) -> Self {
+        let policy = SkillRuntimePolicy::from_env();
+        info!(
+            "skill runtime policy: timeout_ms={}, max_module_bytes={}, max_request_bytes={}, max_stdout_bytes={}, max_stderr_bytes={}, allow_network={}",
+            policy.timeout_ms,
+            policy.max_module_bytes,
+            policy.max_request_bytes,
+            policy.max_stdout_bytes,
+            policy.max_stderr_bytes,
+            policy.allow_network
+        );
+
+        Self {
+            registry,
+            engine: Engine::default(),
+            root: root.into(),
+            policy,
+        }
+    }
+
+    fn skill_path(&self, manifest: &SkillManifest) -> PathBuf {
+        self.root.join(&manifest.id).join(&manifest.entry_wasm)
+    }
+
+    fn validate_module_exists(&self, path: &Path) -> anyhow::Result<()> {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("read module metadata: {}", path.display()))?;
+        let module_len = meta.len() as usize;
+        if module_len > self.policy.max_module_bytes {
+            return Err(anyhow::anyhow!(
+                "module too large ({} > {} bytes): {}",
+                module_len,
+                self.policy.max_module_bytes,
+                path.display()
+            ));
+        }
+
+        Module::from_file(&self.engine, path)
+            .with_context(|| format!("load wasm module: {}", path.display()))?;
+        Ok(())
+    }
+
+    fn enforce_capability_envelope(&self, manifest: &SkillManifest) -> anyhow::Result<()> {
+        self.policy.enforce_capabilities(manifest)
+    }
+
+    async fn run_wasi_json_stdio(
+        &self,
+        manifest: &SkillManifest,
+        path: &Path,
+        request: &SkillRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        let wasmtime_bin =
+            std::env::var("CLAWORK_WASMTIME_BIN").unwrap_or_else(|_| "wasmtime".to_string());
+        let payload = serde_json::to_vec(request).context("serialize skill request")?;
+        if payload.len() > self.policy.max_request_bytes {
+            return Err(anyhow::anyhow!(
+                "skill request too large ({} > {} bytes)",
+                payload.len(),
+                self.policy.max_request_bytes
+            ));
+        }
+
+        let output = Command::new(&wasmtime_bin)
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawn wasmtime executable: {wasmtime_bin}"))?;
+        let output = wait_with_output_with_stdin(
+            output,
+            payload,
+            &manifest.id,
+            self.policy.timeout_ms,
+            self.policy.max_stdout_bytes,
+            self.policy.max_stderr_bytes,
+        )
+        .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow::anyhow!(
+                "skill '{}' failed: {}",
+                manifest.id,
+                if stderr.is_empty() {
+                    "wasmtime exited with error".to_string()
+                } else {
+                    stderr
+                }
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            return Ok(json!({
+                "note": "skill produced empty stdout",
+                "input": request.input
+            }));
+        }
+
+        serde_json::from_str(&stdout).or_else(|_| {
+            Ok(json!({
+                "raw_stdout": stdout
+            }))
+        })
+    }
+}
+
+async fn wait_with_output_with_stdin(
+    mut child: tokio::process::Child,
+    stdin_bytes: Vec<u8>,
+    skill_id: &str,
+    timeout_ms: u64,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> anyhow::Result<std::process::Output> {
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(&stdin_bytes)
+            .await
+            .context("write stdin to skill")?;
+    }
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task =
+        tokio::spawn(async move { read_limited(stdout, max_stdout_bytes, "stdout").await });
+    let stderr_task =
+        tokio::spawn(async move { read_limited(stderr, max_stderr_bytes, "stderr").await });
+
+    let status = match timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+        Ok(waited) => waited.context("wait for skill output")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(anyhow::anyhow!(
+                "skill '{skill_id}' timed out after {timeout_ms}ms"
+            ));
+        }
+    };
+
+    let stdout = stdout_task
+        .await
+        .context("join stdout reader task")?
+        .map_err(|e| anyhow::anyhow!("skill '{skill_id}': {e}"))?;
+    let stderr = stderr_task
+        .await
+        .context("join stderr reader task")?
+        .map_err(|e| anyhow::anyhow!("skill '{skill_id}': {e}"))?;
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_limited(
+    mut reader: Option<impl tokio::io::AsyncRead + Unpin>,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let Some(reader) = reader.as_mut() else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read {label}"))?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > max_bytes {
+            return Err(anyhow::anyhow!(
+                "{} exceeded max bytes ({} > {})",
+                label,
+                out.len() + n,
+                max_bytes
+            ));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    if path.exists() {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn parse_bool_env(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(default)
+}
+
+fn parse_u64_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_usize_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_path_list_env(name: &str) -> Vec<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.split([';', ','])
+                .filter_map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(trimmed))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_string_set_env(name: &str) -> HashSet<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.split([';', ','])
+                .filter_map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[async_trait]
+impl SkillRuntime for WasmSkillRuntime {
+    async fn execute(
+        &self,
+        skill_id: &str,
+        request: SkillRequest,
+    ) -> anyhow::Result<SkillResponse> {
+        let Some(manifest) = self.registry.find(skill_id) else {
+            return Ok(SkillResponse {
+                abi_version: request.abi_version,
+                skill_id: skill_id.to_string(),
+                success: false,
+                output: json!({}),
+                error: Some("skill not found".into()),
+            });
+        };
+
+        let path = self.skill_path(&manifest);
+        self.validate_module_exists(&path)?;
+        self.enforce_capability_envelope(&manifest)?;
+
+        match self.run_wasi_json_stdio(&manifest, &path, &request).await {
+            Ok(output) => Ok(SkillResponse {
+                abi_version: manifest.abi_version,
+                skill_id: skill_id.to_string(),
+                success: true,
+                output,
+                error: None,
+            }),
+            Err(err) => Ok(SkillResponse {
+                abi_version: manifest.abi_version,
+                skill_id: skill_id.to_string(),
+                success: false,
+                output: json!({
+                    "mode": "wasi-json-stdio",
+                    "fallback_echo": request.input
+                }),
+                error: Some(err.to_string()),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_policy() -> SkillRuntimePolicy {
+        SkillRuntimePolicy {
+            timeout_ms: 1_000,
+            max_module_bytes: 1024,
+            max_request_bytes: 1024,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            allow_network: false,
+            allowed_fs_roots: vec![PathBuf::from("allowed")],
+            allowed_env_vars: ["SAFE_TOKEN".to_string()].into_iter().collect(),
+        }
+    }
+
+    fn base_manifest() -> SkillManifest {
+        SkillManifest {
+            id: "echo".into(),
+            name: "Echo".into(),
+            abi_version: "v1".into(),
+            entry_wasm: "skill.wasm".into(),
+            description: None,
+            capabilities: SkillCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn denies_network_when_disabled() {
+        let mut manifest = base_manifest();
+        manifest.capabilities.network = true;
+        let err = test_policy()
+            .enforce_capabilities(&manifest)
+            .expect_err("network should be denied");
+        assert!(err.to_string().contains("network capability"));
+    }
+
+    #[test]
+    fn allows_fs_within_runtime_roots() {
+        let mut manifest = base_manifest();
+        manifest.capabilities.fs_paths = vec!["allowed/subdir".into()];
+        test_policy()
+            .enforce_capabilities(&manifest)
+            .expect("path under allowed root should pass");
+    }
+
+    #[test]
+    fn denies_fs_outside_runtime_roots() {
+        let mut manifest = base_manifest();
+        manifest.capabilities.fs_paths = vec!["denied".into()];
+        let err = test_policy()
+            .enforce_capabilities(&manifest)
+            .expect_err("path outside allowed root should fail");
+        assert!(err.to_string().contains("outside runtime policy"));
+    }
+
+    #[test]
+    fn denies_env_var_not_allowlisted() {
+        let mut manifest = base_manifest();
+        manifest.capabilities.env_vars = vec!["SECRET_KEY".into()];
+        let err = test_policy()
+            .enforce_capabilities(&manifest)
+            .expect_err("env var should be blocked");
+        assert!(err.to_string().contains("outside runtime policy"));
+    }
+}

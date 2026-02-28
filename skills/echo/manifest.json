@@ -1,0 +1,7 @@
+﻿{
+  "id": "echo",
+  "name": "Echo Skill",
+  "abi_version": "v1",
+  "entry_wasm": "echo.wasm",
+  "description": "A minimal smoke-test skill manifest"
+}

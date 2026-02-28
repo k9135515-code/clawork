@@ -1,0 +1,16 @@
+﻿[package]
+name = "clawork-office"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22.1"
+clawork-core = { path = "../clawork-core" }
+reqwest.workspace = true
+rust_xlsxwriter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

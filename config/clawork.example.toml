@@ -1,0 +1,84 @@
+﻿# Clawork Configuration (example)
+
+[app]
+name = "Clawork"
+default_mode = "sandbox"
+allowed_paths = ["C:/Users/renha/Documents", "C:/Temp"]
+elevated_ttl_seconds = 300
+heartbeat_interval_seconds = 1800
+browser_exec_enabled = false
+daemon_only = false
+
+[providers]
+active = "openai"
+
+[providers.openai]
+api_key = ""
+model = "gpt-4.1-mini"
+
+[providers.anthropic]
+api_key = ""
+model = "claude-3-7-sonnet"
+
+[adapters.telegram]
+enabled = false
+bot_token = ""
+default_chat_id = ""
+webhook_secret = ""
+
+[adapters.whatsapp]
+enabled = false
+access_token = ""
+phone_number_id = ""
+default_recipient = ""
+poll_file = "data/whatsapp_inbound.jsonl"
+webhook_verify_token = ""
+app_secret = ""
+inbound_dedupe_file = "data/inbound_seen_ids.log"
+
+[adapters.line]
+enabled = false
+channel_access_token = ""
+
+[adapters.discord]
+enabled = false
+webhook_url = ""
+
+[adapters.slack]
+enabled = false
+webhook_url = ""
+
+[adapters.signal]
+enabled = false
+command = "signal-cli"
+from = ""
+
+[adapters.imessage]
+enabled = false
+
+[audit]
+database_url = "sqlite://data/clawork_audit.db"
+retention_days = 30
+max_rows = 100000
+
+[memory]
+database_url = "sqlite://data/clawork_memory.db"
+default_embedding_mode = "provider_with_deterministic_fallback"
+
+[briefing]
+daily_hour_24 = 8
+suggestion_interval_minutes = 30
+
+[mcp]
+command = ""
+args = ""
+
+[skills.runtime]
+timeout_ms = 10000
+max_module_bytes = 8388608
+max_request_bytes = 262144
+max_stdout_bytes = 1048576
+max_stderr_bytes = 262144
+allow_network = false
+allowed_fs_roots = ""
+allowed_env_vars = ""
