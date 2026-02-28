@@ -88,9 +88,20 @@ try {
     $desktopProc = Start-Process -FilePath $desktopExe -WorkingDirectory $repoRoot -PassThru
 
     $ready = $false
+    $tokenPath = Join-Path $repoRoot "data/cli.token"
     for ($i = 0; $i -lt 90; $i++) {
-        & $cliExe status > $null 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        if (-not (Test-Path $tokenPath)) {
+            Start-Sleep -Seconds 1
+            continue
+        }
+
+        $prevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $null = & $cliExe status 2>$null
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevErrorAction
+
+        if ($exitCode -eq 0) {
             $ready = $true
             break
         }
