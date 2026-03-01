@@ -6,11 +6,12 @@ use crate::{
     append_audit, authorize_action, browser_navigate_inner, call_mcp_tool_inner, config_set_inner,
     config_show_inner, daemon_restart_inner, daemon_start_inner, daemon_stop_inner,
     ensure_action_still_authorized, fs_operate_inner, get_audit_events_inner,
-    get_daily_briefing_inner, list_inbound_messages_inner, list_proactive_suggestions_inner,
-    mail_inbox_unreplied_inner, memory_recent_inner, memory_search_inner, memory_store_inner,
-    office_create_excel_inner, office_upload_graph_file_inner, policy_list_domain_inner,
-    policy_set_domain_inner, send_message_inner, status_inner, task_run_inner, AppState,
-    ApproveReq, BrowserNavigateApiReq, CommandError, ConfigSetReq, CreateSkillReq, FsOperateApiReq,
+    get_daily_briefing_inner, get_operator_store, list_inbound_messages_inner,
+    list_proactive_suggestions_inner, mail_inbox_unreplied_inner, memory_recent_inner,
+    memory_search_inner, memory_store_inner, office_create_excel_inner,
+    office_upload_graph_file_inner, policy_list_domain_inner, policy_set_domain_inner,
+    send_message_inner, status_inner, task_run_inner, truncate_text, AppState, ApproveReq,
+    BrowserNavigateApiReq, CommandError, ConfigSetReq, CreateSkillReq, FsOperateApiReq,
     InboundQuery, LimitQuery, MailInboxItem, MailInboxQuery, McpCallReq, MemorySearchReq,
     MemoryStoreReq, OfficeExcelApiReq, OfficeUploadApiReq, RunSkillReq, SendMessageReq, TaskRunReq,
 };
@@ -19,14 +20,15 @@ use axum::http::HeaderMap;
 use axum::Json;
 use chrono::Utc;
 use clawork_core::{
-    ActionKind, ActionRequest, AuditEvent, BrowserRunRequest, BrowserRunResult, DomainPolicy,
-    FsOperationKind, FsOperationRequest, FsOperationResult, InboundMessage, OfficeUploadResult,
-    SkillRequest, SkillResponse, SkillRuntime, TaskInfo,
+    ActionKind, ActionRequest, AuditEvent, BrowserRunRequest, BrowserRunResult, CitationRef,
+    DomainPolicy, FsOperationKind, FsOperationRequest, FsOperationResult, InboundMessage,
+    OfficeUploadResult, SkillRequest, SkillResponse, SkillRuntime, TaskInfo,
 };
 use clawork_memory::{MemoryHit, MemoryRecord};
 use clawork_skills::SkillManifest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -383,6 +385,36 @@ pub(crate) async fn api_policy_list_domain(
     Ok(Json(policy_list_domain_inner(&state).await?))
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct OpsHealth {
+    started_at: chrono::DateTime<chrono::Utc>,
+    uptime_seconds: i64,
+    nl_requests: u64,
+    nl_failures: u64,
+    inbound_processed: u64,
+    inbound_automations: u64,
+    daemon_restarts: u64,
+    last_error: Option<String>,
+}
+
+pub(crate) async fn api_ops_health(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<OpsHealth>, CommandError> {
+    require_auth(&state, &headers)?;
+    let snap = state.ops_runtime.read().clone();
+    Ok(Json(OpsHealth {
+        started_at: snap.started_at,
+        uptime_seconds: (Utc::now() - snap.started_at).num_seconds().max(0),
+        nl_requests: snap.nl_requests,
+        nl_failures: snap.nl_failures,
+        inbound_processed: snap.inbound_processed,
+        inbound_automations: snap.inbound_automations,
+        daemon_restarts: snap.daemon_restarts,
+        last_error: snap.last_error,
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct NlExecuteReq {
     instruction: String,
@@ -442,6 +474,10 @@ pub(crate) async fn nl_execute_inner(
     continue_on_error: bool,
     approval_token: Option<String>,
 ) -> Result<NlExecuteResult, CommandError> {
+    {
+        let mut ops = state.ops_runtime.write();
+        ops.nl_requests += 1;
+    }
     if instruction.trim().is_empty() {
         return Err(CommandError::validation("instruction must not be empty"));
     }
@@ -476,6 +512,11 @@ pub(crate) async fn nl_execute_inner(
                         result: None,
                         error: Some(err.message.clone()),
                     });
+                    {
+                        let mut ops = state.ops_runtime.write();
+                        ops.nl_failures += 1;
+                        ops.last_error = Some(format!("nl_execute step failed: {}", err.message));
+                    }
                     if !continue_on_error {
                         return Err(err);
                     }
@@ -605,6 +646,10 @@ async fn execute_planned_step(
             let res = browser_navigate_inner(state, req, approval_token).await?;
             serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
         }
+        "browser_autopilot" => {
+            let target = param_str(params, "target")?;
+            browser_autopilot_inner(state, target, approval_token).await
+        }
         "mcp_call" => {
             let tool_name = param_str(params, "tool_name")?;
             let payload = params
@@ -635,6 +680,39 @@ async fn execute_planned_step(
                 .unwrap_or(5);
             web_search_inner(state, query, limit, approval_token).await
         }
+        "connector_status" => {
+            let store = get_operator_store(state)?;
+            let statuses = store
+                .connector_statuses()
+                .await
+                .map_err(|e| CommandError::internal(e.to_string()))?;
+            serde_json::to_value(statuses).map_err(|e| CommandError::internal(e.to_string()))
+        }
+        "workspace_snapshot" => {
+            let store = get_operator_store(state)?;
+            let statuses = store
+                .connector_statuses()
+                .await
+                .map_err(|e| CommandError::internal(e.to_string()))?;
+            let connected = statuses.iter().filter(|s| s.connected).count();
+            Ok(serde_json::json!({
+                "ok": true,
+                "total": statuses.len(),
+                "connected": connected,
+                "providers": statuses
+            }))
+        }
+        "artifact_page" => {
+            let title = param_str(params, "title")?;
+            let body = param_str(params, "content")?;
+            let project_id = params
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned);
+            create_html_artifact_inner(state, title, body, project_id).await
+        }
         other => Err(CommandError::validation(format!(
             "unsupported action '{other}'"
         ))),
@@ -650,9 +728,7 @@ async fn llm_prompt_inner(
         .ok()
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| CommandError::not_configured("CLAWORK_OPENAI_API_KEY is required"))?;
-    let model = model
-        .or_else(|| std::env::var("CLAWORK_OPENAI_CHAT_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let model = select_model_for_task("prompt", model);
     let payload = serde_json::json!({
         "model": model,
         "temperature": 0.2,
@@ -809,6 +885,141 @@ async fn web_search_inner(
     }))
 }
 
+async fn browser_autopilot_inner(
+    state: &AppState,
+    target: &str,
+    approval_token: Option<String>,
+) -> Result<Value, CommandError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(CommandError::validation("target is required"));
+    }
+
+    let mut candidates = Vec::<String>::new();
+    if target.starts_with("http://") || target.starts_with("https://") {
+        candidates.push(target.to_string());
+    } else {
+        candidates.push(format!("https://{target}"));
+        let search = web_search_inner(state, target, 1, approval_token.clone()).await?;
+        if let Some(url) = search
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.get("url"))
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            candidates.push(url.to_string());
+        }
+    }
+    candidates.dedup();
+
+    let mut last_error = None;
+    for url in candidates {
+        let req = BrowserRunRequest {
+            url: url.clone(),
+            allow_domains: vec![],
+            headed: false,
+            timeout_seconds: 30,
+        };
+        match browser_navigate_inner(state, req, approval_token.clone()).await {
+            Ok(result) => {
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "selected_url": url,
+                    "result": result
+                }));
+            }
+            Err(err) => {
+                last_error = Some(err.message);
+            }
+        }
+    }
+
+    Err(CommandError::internal(format!(
+        "browser_autopilot failed: {}",
+        last_error.unwrap_or_else(|| "no candidates".into())
+    )))
+}
+
+async fn create_html_artifact_inner(
+    state: &AppState,
+    title: &str,
+    content: &str,
+    project_id: Option<String>,
+) -> Result<Value, CommandError> {
+    let safe_title = truncate_text(title, 120);
+    let body = truncate_text(content, 10_000);
+    let now = Utc::now();
+    let filename = format!("artifact-{}.html", now.format("%Y%m%d-%H%M%S").to_string());
+    let base_dir = if let Some(pid) = &project_id {
+        PathBuf::from("data").join("projects").join(pid)
+    } else {
+        PathBuf::from("data").join("artifacts")
+    };
+    tokio::fs::create_dir_all(&base_dir)
+        .await
+        .map_err(|e| CommandError::internal(format!("create artifact dir failed: {e}")))?;
+    let path = base_dir.join(filename);
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1><pre>{}</pre></body></html>",
+        html_escape(&safe_title),
+        html_escape(&safe_title),
+        html_escape(&body)
+    );
+    tokio::fs::write(&path, html)
+        .await
+        .map_err(|e| CommandError::internal(format!("write artifact failed: {e}")))?;
+
+    if let Some(pid) = project_id {
+        if let Ok(store) = get_operator_store(state) {
+            let _ = store
+                .add_artifact(
+                    &pid,
+                    path.display().to_string(),
+                    "text/html".to_string(),
+                    Some("nl:artifact_page".to_string()),
+                    Vec::<CitationRef>::new(),
+                )
+                .await;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "mime": "text/html"
+    }))
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+}
+
+fn select_model_for_task(task: &str, preferred: Option<String>) -> String {
+    if let Some(v) = preferred
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return v;
+    }
+    let key = format!(
+        "CLAWORK_OPENAI_MODEL_{}",
+        task.replace('-', "_").to_ascii_uppercase()
+    );
+    if let Ok(v) = std::env::var(&key) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    std::env::var("CLAWORK_OPENAI_CHAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string())
+}
+
 fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, CommandError> {
     params
         .get(key)
@@ -894,6 +1105,13 @@ fn build_rule_plan(instruction: &str) -> Vec<NlPlannedStep> {
             rationale: Some("open command matched".into()),
         }];
     }
+    if let Some(target) = text.strip_prefix("browse ") {
+        return vec![NlPlannedStep {
+            action: "browser_autopilot".into(),
+            params: serde_json::json!({ "target": target.trim() }),
+            rationale: Some("browse command matched".into()),
+        }];
+    }
     if let Some(q) = text.strip_prefix("search ") {
         return vec![NlPlannedStep {
             action: "web_search".into(),
@@ -907,6 +1125,22 @@ fn build_rule_plan(instruction: &str) -> Vec<NlPlannedStep> {
             params: serde_json::json!({ "prompt": q.trim() }),
             rationale: Some("llm command matched".into()),
         }];
+    }
+    if lower.contains("connector") || lower.contains("workspace") {
+        return vec![NlPlannedStep {
+            action: "workspace_snapshot".into(),
+            params: serde_json::json!({}),
+            rationale: Some("workspace/connector keyword matched".into()),
+        }];
+    }
+    if let Some(rest) = text.strip_prefix("artifact ") {
+        if let Some((title, body)) = rest.split_once("::") {
+            return vec![NlPlannedStep {
+                action: "artifact_page".into(),
+                params: serde_json::json!({ "title": title.trim(), "content": body.trim() }),
+                rationale: Some("artifact command matched".into()),
+            }];
+        }
     }
 
     vec![
@@ -931,10 +1165,9 @@ async fn build_llm_plan(
         Ok(v) if !v.trim().is_empty() => v,
         _ => return Ok(None),
     };
-    let model =
-        std::env::var("CLAWORK_OPENAI_CHAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let model = select_model_for_task("planning", None);
 
-    let system = "You are a planner for a local desktop agent. Return only JSON: {\"steps\":[{\"action\":\"status|briefing|suggestions|memory_store|memory_search|fs_read|fs_write|message_send|browser_navigate|mcp_call|llm_prompt|web_search|daemon_start|daemon_stop|daemon_restart|task_run\",\"params\":{},\"rationale\":\"...\"}]}. Use fs write format with params.path and params.content. For message_send include adapter,to,content.";
+    let system = "You are a planner for a local desktop agent. Return only JSON: {\"steps\":[{\"action\":\"status|briefing|suggestions|memory_store|memory_search|fs_read|fs_write|message_send|browser_navigate|browser_autopilot|mcp_call|llm_prompt|web_search|connector_status|workspace_snapshot|artifact_page|daemon_start|daemon_stop|daemon_restart|task_run\",\"params\":{},\"rationale\":\"...\"}]}. Use fs write format with params.path and params.content. For message_send include adapter,to,content.";
     let payload = serde_json::json!({
         "model": model,
         "temperature": 0,

@@ -105,8 +105,12 @@ clawork ask "statusを表示して"
 clawork ask "fs write data/note.txt :: 今日のメモを保存して"
 clawork ask "briefingを見せて"
 clawork ask "search rust tauri mcp"
+clawork ask "browse openai.com"
+clawork ask "workspaceの接続状況を確認して"
+clawork ask "artifact 今週のメモ :: - done: ci stabilized"
 clawork ask "llm このプロジェクトの次の改善点を3つ提案して"
 clawork ask "send telegram 123456 :: 進捗を送って" --dry-run
+clawork ops health
 clawork approve confirm-xxxx
 clawork token issue --ttl-seconds 3600
 clawork token revoke <token>
@@ -193,6 +197,8 @@ clawork policy domain list
 - `CLAWORK_INBOUND_AUTORUN`（`1/true` で受信チャット自動実行）
 - `CLAWORK_INBOUND_REPLY`（`1/true` でチャットへ実行結果返信）
 - `CLAWORK_INBOUND_AUTO_ELEVATE_TTL_SECONDS`（自動実行時に Elevated を有効化する秒数）
+- `CLAWORK_OPENAI_MODEL_PLANNING`（自然言語計画用モデル上書き）
+- `CLAWORK_OPENAI_MODEL_PROMPT`（`llm_prompt` 用モデル上書き）
 
 ### チャット経由で自然言語実行（Telegram/WhatsApp）
 
@@ -213,6 +219,8 @@ $env:CLAWORK_INBOUND_AUTO_ELEVATE_TTL_SECONDS="1800"
 - `/clawork briefingを見せて`
 - `clawork fs write data/note.txt :: これはチャットからのメモ`
 - `clawork search rust async runtime`
+- `clawork browse github.com`
+- `clawork artifact 週次サマリ :: 今週の実施事項`
 
 ## インストール（GitHub Releases）
 

@@ -75,6 +75,10 @@ enum Commands {
         #[command(subcommand)]
         command: LogsCommand,
     },
+    Ops {
+        #[command(subcommand)]
+        command: OpsCommand,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -157,6 +161,11 @@ enum SkillCommand {
 #[derive(Debug, Subcommand)]
 enum LogsCommand {
     Tail,
+}
+
+#[derive(Debug, Subcommand)]
+enum OpsCommand {
+    Health,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1178,6 +1187,12 @@ async fn main() -> anyhow::Result<()> {
                 let res: Value = client
                     .get_json("/v1/logs", Some(vec![("limit", "200".to_string())]))
                     .await?;
+                print_json(&res)?;
+            }
+        },
+        Commands::Ops { command } => match command {
+            OpsCommand::Health => {
+                let res: Value = client.get_json("/v1/ops/health", None).await?;
                 print_json(&res)?;
             }
         },

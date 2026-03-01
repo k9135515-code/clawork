@@ -62,8 +62,8 @@ use local_api_handlers::{
     api_daemon_start, api_daemon_stop, api_fs_operate, api_get_status, api_get_tasks,
     api_inbound_messages, api_list_skills, api_logs, api_mail_inbox_unreplied, api_mcp_call,
     api_memory_recent, api_memory_search, api_memory_store, api_nl_execute, api_office_excel,
-    api_office_upload, api_policy_list_domain, api_policy_set_domain, api_run_skill,
-    api_send_message, api_task_run, nl_execute_inner,
+    api_office_upload, api_ops_health, api_policy_list_domain, api_policy_set_domain,
+    api_run_skill, api_send_message, api_task_run, nl_execute_inner,
 };
 use local_auth::ensure_cli_token;
 use mcp_local::maybe_call_local_connector_mcp_tool;
@@ -116,6 +116,18 @@ struct AppState {
     operator: Arc<RwLock<Option<OperatorStore>>>,
     init_errors: BTreeMap<String, String>,
     http: Client,
+    ops_runtime: Arc<RwLock<OpsRuntime>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpsRuntime {
+    started_at: chrono::DateTime<chrono::Utc>,
+    nl_requests: u64,
+    nl_failures: u64,
+    inbound_processed: u64,
+    inbound_automations: u64,
+    daemon_restarts: u64,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -501,6 +513,9 @@ struct ResearchJobReport {
     findings: Vec<String>,
     citations: Vec<Value>,
     sources: Vec<Value>,
+    confidence_score: f32,
+    contradiction_checks: Vec<String>,
+    trend_assessment: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,6 +811,25 @@ async fn list_proactive_suggestions(
     limit: Option<usize>,
 ) -> Result<Vec<ProactiveSuggestion>, CommandError> {
     list_proactive_suggestions_inner(&state, limit).await
+}
+
+#[tauri::command]
+async fn nl_execute(
+    state: State<'_, AppState>,
+    instruction: String,
+    dry_run: Option<bool>,
+    continue_on_error: Option<bool>,
+    approval_token: Option<String>,
+) -> Result<Value, CommandError> {
+    let result = nl_execute_inner(
+        &state,
+        instruction,
+        dry_run.unwrap_or(false),
+        continue_on_error.unwrap_or(false),
+        approval_token,
+    )
+    .await?;
+    serde_json::to_value(result).map_err(|e| CommandError::internal(e.to_string()))
 }
 
 #[tauri::command]
@@ -1700,6 +1734,10 @@ async fn ingest_inbound_messages_collect(
     let accepted = remember_inbound_messages(state, incoming);
     if accepted.is_empty() {
         return Vec::new();
+    }
+    {
+        let mut ops = state.ops_runtime.write();
+        ops.inbound_processed += accepted.len() as u64;
     }
 
     for msg in &accepted {
@@ -2702,6 +2740,29 @@ async fn build_research_report(
         .iter()
         .filter(|s| s.get("ok").and_then(Value::as_bool) == Some(true))
         .count();
+    let total_count = source_urls.len().max(1);
+    let contradiction_checks = detect_source_contradictions(&sources);
+    let reliability_scores = sources
+        .iter()
+        .filter_map(source_reliability_score)
+        .collect::<Vec<_>>();
+    let avg_reliability = if reliability_scores.is_empty() {
+        0.0
+    } else {
+        reliability_scores.iter().sum::<f32>() / reliability_scores.len() as f32
+    };
+    let contradiction_penalty = (contradiction_checks.len() as f32 * 0.08).min(0.4);
+    let confidence_score = ((ok_count as f32 / total_count as f32) * 0.6 + avg_reliability * 0.4
+        - contradiction_penalty)
+        .clamp(0.0, 1.0);
+    let trend_assessment = if confidence_score > 0.75 {
+        "signals look durable (likely real trend)".to_string()
+    } else if confidence_score > 0.45 {
+        "mixed evidence (partly real, partly hype)".to_string()
+    } else {
+        "low confidence (hype/noise risk is high)".to_string()
+    };
+
     let summary = if ok_count == 0 {
         format!(
             "No sources could be fetched for this question: {}",
@@ -2709,9 +2770,11 @@ async fn build_research_report(
         )
     } else {
         format!(
-            "Collected {} sources ({} successful). Synthesized key findings with citations.",
+            "Collected {} sources ({} successful). Synthesized key findings with citations. confidence={:.2}, contradictions={}.",
             source_urls.len(),
-            ok_count
+            ok_count,
+            confidence_score,
+            contradiction_checks.len()
         )
     };
 
@@ -2722,7 +2785,78 @@ async fn build_research_report(
         findings,
         citations,
         sources,
+        confidence_score,
+        contradiction_checks,
+        trend_assessment,
     })
+}
+
+fn source_reliability_score(source: &Value) -> Option<f32> {
+    if source.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let url = source
+        .get("source_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut score = 0.5f32;
+    let authoritative = [".gov", ".edu", "arxiv.org", "pubmed", "ieee", "acm.org"];
+    if authoritative.iter().any(|k| url.contains(k)) {
+        score += 0.35;
+    }
+    if url.contains("wikipedia.org") {
+        score += 0.15;
+    }
+    if let Some(snippet) = source.get("snippet").and_then(Value::as_str) {
+        if snippet.len() > 500 {
+            score += 0.05;
+        }
+    }
+    Some(score.clamp(0.0, 1.0))
+}
+
+fn detect_source_contradictions(sources: &[Value]) -> Vec<String> {
+    let mut positive = Vec::<String>::new();
+    let mut negative = Vec::<String>::new();
+    for source in sources {
+        if source.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let url = source
+            .get("source_url")
+            .and_then(Value::as_str)
+            .unwrap_or("source")
+            .to_string();
+        let text = source
+            .get("snippet")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if text.contains("increase")
+            || text.contains("growth")
+            || text.contains("effective")
+            || text.contains("improved")
+        {
+            positive.push(url.clone());
+        }
+        if text.contains("decrease")
+            || text.contains("decline")
+            || text.contains("ineffective")
+            || text.contains("failed")
+            || text.contains("not effective")
+        {
+            negative.push(url);
+        }
+    }
+    if positive.is_empty() || negative.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "conflicting sentiment across sources: positive={} negative={}",
+        positive.len(),
+        negative.len()
+    )]
 }
 
 async fn connectors_google_sheets_append_inner(
@@ -3688,6 +3822,7 @@ async fn run_local_api(state: Arc<AppState>) -> anyhow::Result<()> {
         .route("/v1/daemon/restart", post(api_daemon_restart))
         .route("/v1/tasks/run", post(api_task_run))
         .route("/v1/logs", get(api_logs))
+        .route("/v1/ops/health", get(api_ops_health))
         .route("/v1/config", get(api_config_show))
         .route("/v1/config/set", post(api_config_set))
         .route("/v1/webhooks/telegram", post(api_telegram_webhook))
@@ -3869,7 +4004,7 @@ fn get_memory_store(state: &AppState) -> Result<MemoryStore, CommandError> {
     store.ok_or_else(|| CommandError::not_configured("memory store not initialized"))
 }
 
-fn get_operator_store(state: &AppState) -> Result<OperatorStore, CommandError> {
+pub(crate) fn get_operator_store(state: &AppState) -> Result<OperatorStore, CommandError> {
     let store = {
         let guard = state.operator.read();
         guard.clone()
@@ -4531,6 +4666,15 @@ pub fn run() {
         operator: Arc::new(RwLock::new(operator_store)),
         init_errors,
         http: Client::new(),
+        ops_runtime: Arc::new(RwLock::new(OpsRuntime {
+            started_at: Utc::now(),
+            nl_requests: 0,
+            nl_failures: 0,
+            inbound_processed: 0,
+            inbound_automations: 0,
+            daemon_restarts: 0,
+            last_error: None,
+        })),
     };
 
     let local_api_state = Arc::new(app_state.clone());
@@ -4579,7 +4723,13 @@ pub fn run() {
                     .await
                 {
                     tracing::error!("daemon health restart failed: {}", err);
+                    let mut ops = health_state.ops_runtime.write();
+                    ops.last_error = Some(format!("daemon health restart failed: {err}"));
                 } else {
+                    {
+                        let mut ops = health_state.ops_runtime.write();
+                        ops.daemon_restarts += 1;
+                    }
                     push_suggestion(
                         &health_state.suggestions,
                         ProactiveSuggestion {
@@ -4685,10 +4835,31 @@ pub fn run() {
                     let Some(instruction) = inbound_instruction(&msg.content) else {
                         continue;
                     };
+                    {
+                        let mut ops = inbound_state.ops_runtime.write();
+                        ops.inbound_automations += 1;
+                    }
 
-                    let run =
+                    let mut run =
                         nl_execute_inner(&inbound_state, instruction.clone(), false, true, None)
                             .await;
+                    if let Err(err) = &run {
+                        if matches!(err.code, ErrorCode::ConfirmationRequired) {
+                            if let Some(token) = err.confirmation_token.as_deref() {
+                                let approved = inbound_state.permissions.approve_token(token);
+                                if approved {
+                                    run = nl_execute_inner(
+                                        &inbound_state,
+                                        instruction.clone(),
+                                        false,
+                                        true,
+                                        Some(token.to_string()),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
 
                     let summary = match run {
                         Ok(ref result) => {
@@ -4701,6 +4872,10 @@ pub fn run() {
                             summarize_nl_execution(&outcomes)
                         }
                         Err(ref err) => {
+                            let mut ops = inbound_state.ops_runtime.write();
+                            ops.nl_failures += 1;
+                            ops.last_error =
+                                Some(format!("inbound automation failed: {}", err.message));
                             format!("clawork: failed: {:?} ({})", err.code, err.message)
                         }
                     };
@@ -4771,6 +4946,7 @@ pub fn run() {
             memory_store,
             memory_recent,
             memory_search,
+            nl_execute,
             list_proactive_suggestions,
             get_daily_briefing,
             get_inbound_messages,
