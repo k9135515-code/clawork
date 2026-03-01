@@ -104,6 +104,8 @@ clawork status
 clawork ask "statusを表示して"
 clawork ask "fs write data/note.txt :: 今日のメモを保存して"
 clawork ask "briefingを見せて"
+clawork ask "search rust tauri mcp"
+clawork ask "llm このプロジェクトの次の改善点を3つ提案して"
 clawork ask "send telegram 123456 :: 進捗を送って" --dry-run
 clawork approve confirm-xxxx
 clawork token issue --ttl-seconds 3600
@@ -188,6 +190,29 @@ clawork policy domain list
 - `CLAWORK_MEDIA_ENDPOINT_<PROVIDER>_IMAGE`, `CLAWORK_MEDIA_ENDPOINT_<PROVIDER>_VIDEO`
 - `CLAWORK_MEDIA_API_KEY`, `CLAWORK_MEDIA_API_KEY_<PROVIDER>`
 - `CLAWORK_ENABLE_IMESSAGE`（macOS のみ）
+- `CLAWORK_INBOUND_AUTORUN`（`1/true` で受信チャット自動実行）
+- `CLAWORK_INBOUND_REPLY`（`1/true` でチャットへ実行結果返信）
+- `CLAWORK_INBOUND_AUTO_ELEVATE_TTL_SECONDS`（自動実行時に Elevated を有効化する秒数）
+
+### チャット経由で自然言語実行（Telegram/WhatsApp）
+
+1. 受信経路（Webhook または poll）を設定
+2. 自動実行を有効化
+
+```powershell
+$env:CLAWORK_INBOUND_AUTORUN="1"
+$env:CLAWORK_INBOUND_REPLY="1"
+# 危険操作も自動実行したい場合のみ（任意）
+$env:CLAWORK_INBOUND_AUTO_ELEVATE_TTL_SECONDS="1800"
+```
+
+3. チャットで `clawork ` または `/clawork ` プレフィックス付きで送信
+
+例:
+- `clawork status`
+- `/clawork briefingを見せて`
+- `clawork fs write data/note.txt :: これはチャットからのメモ`
+- `clawork search rust async runtime`
 
 ## インストール（GitHub Releases）
 

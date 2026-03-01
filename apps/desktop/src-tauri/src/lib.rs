@@ -63,7 +63,7 @@ use local_api_handlers::{
     api_inbound_messages, api_list_skills, api_logs, api_mail_inbox_unreplied, api_mcp_call,
     api_memory_recent, api_memory_search, api_memory_store, api_nl_execute, api_office_excel,
     api_office_upload, api_policy_list_domain, api_policy_set_domain, api_run_skill,
-    api_send_message, api_task_run,
+    api_send_message, api_task_run, nl_execute_inner,
 };
 use local_auth::ensure_cli_token;
 use mcp_local::maybe_call_local_connector_mcp_tool;
@@ -1687,9 +1687,19 @@ async fn ingest_inbound_messages(
     actor: &str,
     incoming: Vec<InboundMessage>,
 ) -> usize {
+    ingest_inbound_messages_collect(state, actor, incoming)
+        .await
+        .len()
+}
+
+async fn ingest_inbound_messages_collect(
+    state: &AppState,
+    actor: &str,
+    incoming: Vec<InboundMessage>,
+) -> Vec<InboundMessage> {
     let accepted = remember_inbound_messages(state, incoming);
     if accepted.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     for msg in &accepted {
@@ -1718,7 +1728,41 @@ async fn ingest_inbound_messages(
             text: format!("{} new inbound messages received.", accepted.len()),
         },
     );
-    accepted.len()
+    accepted
+}
+
+fn inbound_instruction(content: &str) -> Option<String> {
+    let text = content.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let lowered = text.to_ascii_lowercase();
+    if let Some(rest) = lowered.strip_prefix("/clawork ") {
+        let offset = text.len() - rest.len();
+        return Some(text[offset..].trim().to_string());
+    }
+    if let Some(rest) = lowered.strip_prefix("clawork ") {
+        let offset = text.len() - rest.len();
+        return Some(text[offset..].trim().to_string());
+    }
+    if let Some(rest) = lowered.strip_prefix("@clawork ") {
+        let offset = text.len() - rest.len();
+        return Some(text[offset..].trim().to_string());
+    }
+    None
+}
+
+fn summarize_nl_execution(outcomes: &[serde_json::Value]) -> String {
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    for row in outcomes {
+        if row.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            ok_count += 1;
+        } else {
+            fail_count += 1;
+        }
+    }
+    format!("clawork: executed steps ok={ok_count} failed={fail_count}")
 }
 
 async fn list_inbound_messages_inner(
@@ -4596,10 +4640,103 @@ pub fn run() {
 
     let inbound_state = Arc::new(app_state.clone());
     tauri::async_runtime::spawn(async move {
+        let autorun_enabled = std::env::var("CLAWORK_INBOUND_AUTORUN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let reply_enabled = std::env::var("CLAWORK_INBOUND_REPLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let auto_elevate_ttl = std::env::var("CLAWORK_INBOUND_AUTO_ELEVATE_TTL_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0);
+
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             if let Ok(messages) = poll_adapters_once(&inbound_state).await {
-                let _ = ingest_inbound_messages(&inbound_state, "adapter-poller", messages).await;
+                let accepted =
+                    ingest_inbound_messages_collect(&inbound_state, "adapter-poller", messages)
+                        .await;
+                if !autorun_enabled || accepted.is_empty() {
+                    continue;
+                }
+
+                if let Some(ttl) = auto_elevate_ttl {
+                    let mode = inbound_state.permissions.request_elevation(ttl);
+                    append_audit(
+                        &inbound_state,
+                        &AuditEvent {
+                            timestamp: Utc::now(),
+                            actor: "inbound_automation".into(),
+                            action: ActionKind::ElevatedRequest,
+                            target: Some("auto-elevate".into()),
+                            decision: "allowed".into(),
+                            reason: Some(format!(
+                                "auto elevated for inbound automation, mode={}",
+                                permission_mode_label(&mode)
+                            )),
+                            trace_id: Uuid::new_v4(),
+                        },
+                    )
+                    .await;
+                }
+
+                for msg in accepted {
+                    let Some(instruction) = inbound_instruction(&msg.content) else {
+                        continue;
+                    };
+
+                    let run =
+                        nl_execute_inner(&inbound_state, instruction.clone(), false, true, None)
+                            .await;
+
+                    let summary = match run {
+                        Ok(ref result) => {
+                            let serialized = serde_json::to_value(result).unwrap_or_default();
+                            let outcomes = serialized
+                                .get("outcomes")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            summarize_nl_execution(&outcomes)
+                        }
+                        Err(ref err) => {
+                            format!("clawork: failed: {:?} ({})", err.code, err.message)
+                        }
+                    };
+
+                    append_audit(
+                        &inbound_state,
+                        &AuditEvent {
+                            timestamp: Utc::now(),
+                            actor: "inbound_automation".into(),
+                            action: ActionKind::SkillExecute,
+                            target: Some(format!("{}:{}", msg.adapter, msg.from)),
+                            decision: if run.is_ok() {
+                                "allowed".into()
+                            } else {
+                                "denied".into()
+                            },
+                            reason: Some(format!(
+                                "instruction='{}'",
+                                truncate_text(&instruction, 160)
+                            )),
+                            trace_id: Uuid::new_v4(),
+                        },
+                    )
+                    .await;
+
+                    if reply_enabled {
+                        let _ = send_message_inner(
+                            &inbound_state,
+                            msg.adapter.clone(),
+                            msg.from.clone(),
+                            summary,
+                            None,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     });

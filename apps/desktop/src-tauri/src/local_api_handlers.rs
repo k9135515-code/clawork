@@ -424,13 +424,31 @@ pub(crate) async fn api_nl_execute(
     Json(body): Json<NlExecuteReq>,
 ) -> Result<Json<NlExecuteResult>, CommandError> {
     require_auth(&state, &headers)?;
-    if body.instruction.trim().is_empty() {
+    let result = nl_execute_inner(
+        &state,
+        body.instruction,
+        body.dry_run.unwrap_or(false),
+        body.continue_on_error.unwrap_or(false),
+        body.approval_token,
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+pub(crate) async fn nl_execute_inner(
+    state: &AppState,
+    instruction: String,
+    dry_run: bool,
+    continue_on_error: bool,
+    approval_token: Option<String>,
+) -> Result<NlExecuteResult, CommandError> {
+    if instruction.trim().is_empty() {
         return Err(CommandError::validation("instruction must not be empty"));
     }
 
-    let (steps, plan_source, model) = match build_llm_plan(&state, &body.instruction).await {
+    let (steps, plan_source, model) = match build_llm_plan(state, &instruction).await {
         Ok(Some((steps, model))) => (steps, "llm".to_string(), Some(model)),
-        _ => (build_rule_plan(&body.instruction), "rule".to_string(), None),
+        _ => (build_rule_plan(&instruction), "rule".to_string(), None),
     };
 
     if steps.is_empty() {
@@ -439,13 +457,10 @@ pub(crate) async fn api_nl_execute(
         ));
     }
 
-    let dry_run = body.dry_run.unwrap_or(false);
-    let continue_on_error = body.continue_on_error.unwrap_or(false);
     let mut outcomes = Vec::<NlStepOutcome>::new();
-
     if !dry_run {
         for (idx, step) in steps.iter().enumerate() {
-            match execute_planned_step(&state, step, body.approval_token.clone()).await {
+            match execute_planned_step(state, step, approval_token.clone()).await {
                 Ok(result) => outcomes.push(NlStepOutcome {
                     index: idx,
                     action: step.action.clone(),
@@ -469,14 +484,14 @@ pub(crate) async fn api_nl_execute(
         }
     }
 
-    Ok(Json(NlExecuteResult {
-        instruction: body.instruction,
+    Ok(NlExecuteResult {
+        instruction,
         plan_source,
         model,
         dry_run,
         steps,
         outcomes,
-    }))
+    })
 }
 
 async fn execute_planned_step(
@@ -605,10 +620,193 @@ async fn execute_planned_step(
                     .await?;
             serde_json::to_value(res).map_err(|e| CommandError::internal(e.to_string()))
         }
+        "llm_prompt" => {
+            let prompt = param_str(params, "prompt")?;
+            let model = params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            llm_prompt_inner(state, prompt, model).await
+        }
+        "web_search" => {
+            let query = param_str(params, "query")?;
+            let limit = param_i64(params, "limit")
+                .map(|v| v.max(1) as usize)
+                .unwrap_or(5);
+            web_search_inner(state, query, limit, approval_token).await
+        }
         other => Err(CommandError::validation(format!(
             "unsupported action '{other}'"
         ))),
     }
+}
+
+async fn llm_prompt_inner(
+    state: &AppState,
+    prompt: &str,
+    model: Option<String>,
+) -> Result<Value, CommandError> {
+    let api_key = std::env::var("CLAWORK_OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| CommandError::not_configured("CLAWORK_OPENAI_API_KEY is required"))?;
+    let model = model
+        .or_else(|| std::env::var("CLAWORK_OPENAI_CHAT_MODEL").ok())
+        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let payload = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        "messages": [
+            {"role":"system","content":"You are a concise assistant for local automation tasks."},
+            {"role":"user","content": prompt}
+        ]
+    });
+    let resp = state
+        .http
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(40))
+        .send()
+        .await
+        .map_err(|e| CommandError::internal(format!("llm request failed: {e}")))?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| CommandError::internal(format!("llm response parse failed: {e}")))?;
+    if !status.is_success() {
+        return Err(CommandError::internal(format!(
+            "llm failed ({}): {}",
+            status.as_u16(),
+            body
+        )));
+    }
+    let content = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(serde_json::json!({
+        "ok": true,
+        "model": model,
+        "content": content
+    }))
+}
+
+async fn web_search_inner(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    approval_token: Option<String>,
+) -> Result<Value, CommandError> {
+    let action = ActionRequest {
+        kind: ActionKind::NetworkCall,
+        target: Some("https://api.duckduckgo.com/".into()),
+        params: serde_json::json!({ "query": query, "limit": limit }),
+        trace_id: Uuid::new_v4(),
+    };
+    let ctx = authorize_action(state, &action, approval_token).await?;
+    ensure_action_still_authorized(state, &action, &ctx).await?;
+    let mode = state.permissions.current_mode();
+
+    let resp = state
+        .http
+        .get("https://api.duckduckgo.com/")
+        .query(&[
+            ("q", query),
+            ("format", "json"),
+            ("no_html", "1"),
+            ("no_redirect", "1"),
+        ])
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| CommandError::internal(format!("web search request failed: {e}")))?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| CommandError::internal(format!("web search parse failed: {e}")))?;
+    if !status.is_success() {
+        return Err(CommandError::internal(format!(
+            "web search failed ({}): {}",
+            status.as_u16(),
+            body
+        )));
+    }
+
+    let mut results = Vec::<Value>::new();
+    if let Some(topic) = body
+        .get("AbstractText")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        results.push(serde_json::json!({
+            "title": body.get("Heading").and_then(Value::as_str).unwrap_or("DuckDuckGo Instant Answer"),
+            "url": body.get("AbstractURL").and_then(Value::as_str).unwrap_or(""),
+            "snippet": topic
+        }));
+    }
+    if let Some(related) = body.get("RelatedTopics").and_then(Value::as_array) {
+        for item in related {
+            if results.len() >= limit {
+                break;
+            }
+            if let Some(text) = item.get("Text").and_then(Value::as_str) {
+                results.push(serde_json::json!({
+                    "title": text,
+                    "url": item.get("FirstURL").and_then(Value::as_str).unwrap_or(""),
+                    "snippet": text
+                }));
+                continue;
+            }
+            if let Some(topics) = item.get("Topics").and_then(Value::as_array) {
+                for sub in topics {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    if let Some(text) = sub.get("Text").and_then(Value::as_str) {
+                        results.push(serde_json::json!({
+                            "title": text,
+                            "url": sub.get("FirstURL").and_then(Value::as_str).unwrap_or(""),
+                            "snippet": text
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    results.truncate(limit);
+
+    append_audit(
+        state,
+        &AuditEvent {
+            timestamp: Utc::now(),
+            actor: ctx.actor,
+            action: action.kind,
+            target: action.target,
+            decision: "allowed".into(),
+            reason: Some(format!(
+                "mode={}, query_len={}, results={}",
+                crate::permission_mode_label(&mode),
+                query.len(),
+                results.len()
+            )),
+            trace_id: action.trace_id,
+        },
+    )
+    .await;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "query": query,
+        "results": results
+    }))
 }
 
 fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, CommandError> {
@@ -696,6 +894,20 @@ fn build_rule_plan(instruction: &str) -> Vec<NlPlannedStep> {
             rationale: Some("open command matched".into()),
         }];
     }
+    if let Some(q) = text.strip_prefix("search ") {
+        return vec![NlPlannedStep {
+            action: "web_search".into(),
+            params: serde_json::json!({ "query": q.trim(), "limit": 5 }),
+            rationale: Some("search command matched".into()),
+        }];
+    }
+    if let Some(q) = text.strip_prefix("llm ") {
+        return vec![NlPlannedStep {
+            action: "llm_prompt".into(),
+            params: serde_json::json!({ "prompt": q.trim() }),
+            rationale: Some("llm command matched".into()),
+        }];
+    }
 
     vec![
         NlPlannedStep {
@@ -722,7 +934,7 @@ async fn build_llm_plan(
     let model =
         std::env::var("CLAWORK_OPENAI_CHAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
-    let system = "You are a planner for a local desktop agent. Return only JSON: {\"steps\":[{\"action\":\"status|briefing|suggestions|memory_store|memory_search|fs_read|fs_write|message_send|browser_navigate|mcp_call|daemon_start|daemon_stop|daemon_restart|task_run\",\"params\":{},\"rationale\":\"...\"}]}. Use fs write format with params.path and params.content. For message_send include adapter,to,content.";
+    let system = "You are a planner for a local desktop agent. Return only JSON: {\"steps\":[{\"action\":\"status|briefing|suggestions|memory_store|memory_search|fs_read|fs_write|message_send|browser_navigate|mcp_call|llm_prompt|web_search|daemon_start|daemon_stop|daemon_restart|task_run\",\"params\":{},\"rationale\":\"...\"}]}. Use fs write format with params.path and params.content. For message_send include adapter,to,content.";
     let payload = serde_json::json!({
         "model": model,
         "temperature": 0,
