@@ -951,7 +951,7 @@ async fn create_html_artifact_inner(
     let safe_title = truncate_text(title, 120);
     let body = truncate_text(content, 10_000);
     let now = Utc::now();
-    let filename = format!("artifact-{}.html", now.format("%Y%m%d-%H%M%S").to_string());
+    let filename = format!("artifact-{}.html", now.format("%Y%m%d-%H%M%S"));
     let base_dir = if let Some(pid) = &project_id {
         PathBuf::from("data").join("projects").join(pid)
     } else {
